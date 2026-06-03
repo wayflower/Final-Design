@@ -43,38 +43,78 @@ class FSCutSegmenter:
 
     def segment(self, image):
         """
-        执行完整的前景分割 (加入边界先验与双目标拓扑约束)
+        执行完整的前景分割 (融合频域显著性、中心先验与色彩对比度先验)
         """
-        # 1. 频域显著性先验
+        H, W = image.shape[:2]
+        
+        # ==========================================
+        # 1. 频域显著性 + 中心先验 (Center Prior)
+        # ==========================================
         saliency_map = self.spectral_residual_saliency(image)
         
-        # 2. Felzenszwalb 超像素提取
+        # 生成二维中心高斯遮罩
+        Y, X = np.ogrid[:H, :W]
+        center_y, center_x = H / 2, W / 2
+        sigma_y, sigma_x = H / 2.5, W / 2.5 
+        center_prior = np.exp(-((X - center_x)**2 / (2 * sigma_x**2) + (Y - center_y)**2 / (2 * sigma_y**2)))
+        
+        # 压暗四周，突出中心
+        saliency_map = saliency_map * center_prior
+        saliency_map = cv2.normalize(saliency_map, None, 0, 1, cv2.NORM_MINMAX)
+        
+        # ==========================================
+        # 2. Felzenszwalb 超像素
+        # ==========================================
         rgb_img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         segments = felzenszwalb(rgb_img, scale=self.fz_scale, sigma=self.fz_sigma, min_size=self.fz_min_size)
         num_nodes = np.max(segments) + 1
         
         # ==========================================
-        # [新增约束 1] 提取图像边界上的超像素 (边界背景先验)
+        # 3. 提取背景色彩对比度先验 (Background Contrast)
         # ==========================================
-        boundary_mask = np.zeros_like(segments, dtype=bool)
-        boundary_mask[0, :] = True      # 顶边
-        boundary_mask[-1, :] = True     # 底边
-        boundary_mask[:, 0] = True      # 左边
-        boundary_mask[:, -1] = True     # 右边
-        # 找到所有与边界有交集的超像素 ID
-        boundary_segments = np.unique(segments[boundary_mask])
+        # 提取图像四周一圈 (5 pixels) 作为绝对背景基准
+        boundary_mask = np.zeros((H, W), dtype=bool)
+        boundary_mask[0:5, :] = True
+        boundary_mask[-5:, :] = True
+        boundary_mask[:, 0:5] = True
+        boundary_mask[:, -5:] = True
         
-        # 3. 计算超像素级别的数据项，并引入 Otsu 自适应阈值
+        boundary_segments = np.unique(segments[boundary_mask])
+        bg_mean_color = np.mean(rgb_img[boundary_mask], axis=0) # 提取背景的平均 RGB 颜色
+        
+        # ==========================================
+        # 4. 计算综合节点显著性 (Data Term 强化)
+        # ==========================================
         node_saliency = np.zeros(num_nodes)
         for i in range(num_nodes):
             mask = (segments == i)
-            node_saliency[i] = np.mean(saliency_map[mask])
+            # 频域显著性均值
+            sr_val = np.mean(saliency_map[mask])
             
-        sal_uint8 = (saliency_map * 255).astype(np.uint8)
+            # 计算该块颜色与背景平均颜色的欧几里得距离
+            node_color = np.mean(rgb_img[mask], axis=0)
+            color_dist = np.linalg.norm(node_color - bg_mean_color)
+            
+            # [核心突破] 频域(看纹理) * 色彩对比度(看颜色)
+            # 这能完美过滤掉高频噪点(如草地)：即使草地纹理复杂(sr_val高)，
+            # 但只要它颜色跟边缘草地一样(color_dist低)，综合显著性就会被压下去。
+            node_saliency[i] = sr_val * color_dist
+            
+        # 综合显著性归一化到 [0, 1]
+        node_saliency = (node_saliency - np.min(node_saliency)) / (np.max(node_saliency) - np.min(node_saliency) + 1e-8)
+        
+        # 将一维的节点显著性重建为二维图像，以便使用 Otsu 寻找全局阈值
+        saliency_2d = np.zeros((H, W), dtype=np.float32)
+        for i in range(num_nodes):
+            saliency_2d[segments == i] = node_saliency[i]
+            
+        sal_uint8 = (saliency_2d * 255).astype(np.uint8)
         otsu_thresh_val, _ = cv2.threshold(sal_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         otsu_thresh = otsu_thresh_val / 255.0
         
-        # 4. 构建图割 (Graph Cut)
+        # ==========================================
+        # 5. 构建图割 (Graph Cut)
+        # ==========================================
         rag = graph.rag_mean_color(rgb_img, segments)
         g = maxflow.Graph[float]()
         nodes = g.add_nodes(num_nodes)
@@ -84,7 +124,7 @@ class FSCutSegmenter:
             sal_val = node_saliency[i]
             
             if i in boundary_segments:
-                # [核心逻辑] 如果挨着图片边缘，强制判定为背景！彻底消灭背景反转。
+                # 依然保留边界背景先验，稳住阵脚
                 weight_fg, weight_bg = 0.0, 1000.0
             elif sal_val > otsu_thresh * 1.1:
                 weight_fg, weight_bg = 1000.0, 0.0
@@ -105,35 +145,12 @@ class FSCutSegmenter:
             smooth_weight = lambda_smooth * np.exp(- (color_diff ** 2) / gamma)
             g.add_edge(nodes[n1], nodes[n2], smooth_weight, smooth_weight)
             
-        # 5. 求解最大流最小割并生成初步掩膜
+        # 求解最大流最小割
         g.maxflow()
         binary_mask = np.zeros_like(segments, dtype=np.uint8)
         for i in range(num_nodes):
             if g.get_segment(nodes[i]) == 0: 
                 binary_mask[segments == i] = 1
                 
-        # ==========================================
-        # [新增约束 2] 利用你的关键信息：双目标拓扑约束
-        # ==========================================
-        # 寻找所有独立连通的白色前景块
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
-        
-        final_mask = np.zeros_like(binary_mask)
-        
-        # num_labels 包含了背景(label 0)，所以如果 >= 3，说明找到了至少 2 个前景块
-        if num_labels >= 3:
-            # 提取所有前景块的面积 (跳过 stats[0]，因为那是背景的面积)
-            areas = stats[1:, cv2.CC_STAT_AREA]
-            # 找到面积最大的前 2 个连通域的索引
-            # 注意：argsort 返回的是从小到大的索引，所以取最后两个 [-2:]
-            # 索引 + 1 是为了对应回原来的 label 编号
-            top2_idx = np.argsort(areas)[-2:] + 1
-            
-            # 强制只保留这 2 个最大面积的前景，其余噪点全部抹除
-            final_mask[labels == top2_idx[0]] = 1
-            final_mask[labels == top2_idx[1]] = 1
-        else:
-            # 极端情况兜底：如果连 2 个目标都没找够，就保留原样
-            final_mask = binary_mask 
-                
-        return final_mask
+        # [彻底移除连通域拦截逻辑]，直接返回原始的、允许小碎片前景的图割掩膜
+        return binary_mask

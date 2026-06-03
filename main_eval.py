@@ -114,9 +114,10 @@ def batch_solve2(str_impath, str_gtpath, visualize_step=10):
             
             plt.tight_layout()
             
-            # 非阻塞式展示，用户可以在查看完毕后手动关闭窗口继续处理下一批图像
-            plt.show(block=False)
-            plt.pause(0.1)  # 确保图像窗口能正确
+            plt.show()
+            # # 非阻塞式展示，用户可以在查看完毕后手动关闭窗口继续处理下一批图像
+            # plt.show(block=False)
+            # plt.pause(0.1)  # 确保图像窗口能正确
 
     # 统计信息打印
     if has_groundtruth:
@@ -140,4 +141,4 @@ if __name__ == '__main__':
     GT_DIR = "./Weizmann2TruthOne/"
     
     # 批量测试，设置 visualize_step=3，意味着每处理 3 张图弹出一个对比窗口
-    batch_solve2(IMAGE_DIR, GT_DIR, visualize_step=10)
+    batch_solve2(IMAGE_DIR, GT_DIR, visualize_step=11)
