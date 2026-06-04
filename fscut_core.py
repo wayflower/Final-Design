@@ -152,5 +152,21 @@ class FSCutSegmenter:
             if g.get_segment(nodes[i]) == 0: 
                 binary_mask[segments == i] = 1
                 
-        # [彻底移除连通域拦截逻辑]，直接返回原始的、允许小碎片前景的图割掩膜
+        # ==========================================
+        # 6. 后处理：你的新主意落地 (异色区域强行挽回)
+        # ==========================================
+        
+        # (1) 闭运算 (Close)：解决“边缘阴影或细碎部分脱离主体”的问题
+        # 用一个稍微大一点的核 (比如 9x9)，把离得近的前景碎块强制“桥接”起来
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, close_kernel)
+        
+        # (2) 轮廓孔洞填充 (Hole Filling)：解决“眼睛、嘴巴、内部阴影被掏空”的问题
+        # 寻找当前掩膜的【所有外部轮廓】
+        contours, hierarchy = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # 顺着最外围的轮廓，把里面的区域全部涂满 (thickness=cv2.FILLED)
+        # 这就相当于你说的“把小区域内其他的联通块强行加到前景中去”
+        cv2.drawContours(binary_mask, contours, -1, 1, thickness=cv2.FILLED)
+        
         return binary_mask
