@@ -134,7 +134,7 @@ def batch_solve2(str_impath, str_gtpath, visualize_step=5, save_dir="./Output_Re
             plt.axis('off')
             
             plt.tight_layout()
-            plt.show()
+            # plt.show()
 
     # 统计信息打印
     if has_groundtruth:
@@ -159,4 +159,4 @@ if __name__ == '__main__':
     GT_DIR = "./Weizmann2TruthOne/"
     
     # 增加了一个 save_dir 参数，默认保存在当前目录下的 Output_Results 文件夹
-    batch_solve2(IMAGE_DIR, GT_DIR, visualize_step=10, save_dir="./Output_Results")
+    batch_solve2(IMAGE_DIR, GT_DIR, visualize_step=100, save_dir="./Output_Results")
