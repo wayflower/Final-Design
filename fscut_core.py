@@ -43,45 +43,110 @@ class FSCutSegmenter:
 
     def segment(self, image):
         """
-        执行完整的前景分割 (融合频域显著性、中心先验与色彩对比度先验)
+        执行完整的前景分割 (抗收缩、强制外扩版)
         """
         H, W = image.shape[:2]
         
         # ==========================================
-        # 1. 频域显著性 + 中心先验 (Center Prior)
+        # 1. 频域显著性 + 暴力物理膨胀 (撑大基础盘)
         # ==========================================
         saliency_map = self.spectral_residual_saliency(image)
         
-        # 生成二维中心高斯遮罩
+        # [核心修改 1] 用一个巨大的核，把显著性高亮区强行向外推延！
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+        saliency_map = cv2.dilate(saliency_map, dilate_kernel)
+        saliency_map = cv2.GaussianBlur(saliency_map, (15, 15), 0) # 柔和边缘防止锯齿
+        
+        # 中心先验 (压暗四周)
         Y, X = np.ogrid[:H, :W]
         center_y, center_x = H / 2, W / 2
         sigma_y, sigma_x = H / 2.5, W / 2.5 
         center_prior = np.exp(-((X - center_x)**2 / (2 * sigma_x**2) + (Y - center_y)**2 / (2 * sigma_y**2)))
         
-        # 压暗四周，突出中心
         saliency_map = saliency_map * center_prior
         saliency_map = cv2.normalize(saliency_map, None, 0, 1, cv2.NORM_MINMAX)
         
         # ==========================================
-        # 2. Felzenszwalb 超像素
+        # 2. Felzenszwalb 超像素 (切得更细碎)
         # ==========================================
         rgb_img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        segments = felzenszwalb(rgb_img, scale=self.fz_scale, sigma=self.fz_sigma, min_size=self.fz_min_size)
+        # [核心修改 2] scale 从 100 降到 50，min_size 降到 20。
+        # 块切得越小，边缘的贴合度就越高，不会被背景拖累
+        segments = felzenszwalb(rgb_img, scale=50, sigma=0.5, min_size=20)
         num_nodes = np.max(segments) + 1
         
-        # ==========================================
-        # 3. 提取背景色彩对比度先验 (Background Contrast)
-        # ==========================================
-        # 提取图像四周一圈 (5 pixels) 作为绝对背景基准
+        # 背景色彩对比度先验
         boundary_mask = np.zeros((H, W), dtype=bool)
         boundary_mask[0:5, :] = True
         boundary_mask[-5:, :] = True
         boundary_mask[:, 0:5] = True
         boundary_mask[:, -5:] = True
-        
         boundary_segments = np.unique(segments[boundary_mask])
-        bg_mean_color = np.mean(rgb_img[boundary_mask], axis=0) # 提取背景的平均 RGB 颜色
+        bg_mean_color = np.mean(rgb_img[boundary_mask], axis=0) 
         
+        # 计算节点显著性
+        node_saliency = np.zeros(num_nodes)
+        for i in range(num_nodes):
+            mask = (segments == i)
+            sr_val = np.mean(saliency_map[mask])
+            node_color = np.mean(rgb_img[mask], axis=0)
+            color_dist = np.linalg.norm(node_color - bg_mean_color)
+            node_saliency[i] = sr_val * color_dist
+            
+        node_saliency = (node_saliency - np.min(node_saliency)) / (np.max(node_saliency) - np.min(node_saliency) + 1e-8)
+        
+        saliency_2d = np.zeros((H, W), dtype=np.float32)
+        for i in range(num_nodes):
+            saliency_2d[segments == i] = node_saliency[i]
+            
+        sal_uint8 = (saliency_2d * 255).astype(np.uint8)
+        otsu_thresh_val, _ = cv2.threshold(sal_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        otsu_thresh = otsu_thresh_val / 255.0
+        
+        # ==========================================
+        # 3. 构建图割 (Graph Cut)
+        # ==========================================
+        rag = graph.rag_mean_color(rgb_img, segments)
+        g = maxflow.Graph[float]()
+        nodes = g.add_nodes(num_nodes)
+        
+        for i in range(num_nodes):
+            sal_val = node_saliency[i]
+            
+            if i in boundary_segments:
+                weight_fg, weight_bg = 0.0, 1000.0
+            # [核心修改 3] 放宽前景门槛 (0.8)，收紧背景门槛 (0.4)
+            elif sal_val > otsu_thresh * 0.8:
+                weight_fg, weight_bg = 1000.0, 0.0
+            elif sal_val < otsu_thresh * 0.4:
+                weight_fg, weight_bg = 0.0, 1000.0
+            else:
+                # [核心修改 4] 气球膨胀力 (Balloon Force)
+                # 强行给前景加 5.0 的保底分，鼓励向外扩张
+                weight_fg = sal_val * 10.0 + 7.0
+                weight_bg = (1.0 - sal_val) * 10.0
+                
+            g.add_tedge(nodes[i], weight_fg, weight_bg)
+            
+        # 添加平滑项边
+        gamma = 900.0 
+        # [核心修改 5] 降低平滑惩罚 (从 1.0 降至 0.3)
+        # 告诉算法：别怕切出来的边缘太长、弯曲，大胆去贴合物体轮廓！
+        lambda_smooth = 0.12 
+        
+        for edge in rag.edges:
+            n1, n2 = edge
+            color_diff = rag[n1][n2]['weight'] 
+            smooth_weight = lambda_smooth * np.exp(- (color_diff ** 2) / gamma)
+            g.add_edge(nodes[n1], nodes[n2], smooth_weight, smooth_weight)
+            
+        g.maxflow()
+        binary_mask = np.zeros_like(segments, dtype=np.uint8)
+        for i in range(num_nodes):
+            if g.get_segment(nodes[i]) == 0: 
+                binary_mask[segments == i] = 1
+
+        # ====== 下面接你保留的那段“闭运算与孔洞填充”的后处理代码 ======
         # ==========================================
         # 4. 计算综合节点显著性 (Data Term 强化)
         # ==========================================

@@ -134,7 +134,7 @@ def batch_solve2(str_impath, str_gtpath, visualize_step=5, save_dir="./Output_Re
             plt.axis('off')
             
             plt.tight_layout()
-            # plt.show()
+            plt.show()
 
     # 统计信息打印
     if has_groundtruth:
